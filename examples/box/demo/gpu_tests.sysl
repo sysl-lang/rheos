@@ -1,0 +1,28 @@
+module demo
+@tests
+
+import sh.sysl.sdl3.{GPU_SHADERFORMAT_MSL, INIT_VIDEO, error, gpu_device, init, quit}
+import sysl.process
+
+// Compile the actual embedded body shaders with Metal, rather than checking their source as text.
+// In particular, this catches collisions with Metal's reserved type names such as `quad`.
+@test("all body shaders and the point light compile into a depth-tested pipeline")
+shader_pipeline()
+    val desktop = process.capture("/bin/launchctl", ["managername"]) match
+        Ok(out) -> out.text.starts_with("Aqua")
+        Err(_) -> false
+
+    if !desktop
+        print("SKIPPED GPU verification: no macOS desktop session")
+        return
+
+    if !init(INIT_VIDEO)
+        print("SKIPPED GPU verification: " + error())
+        return
+
+    defer quit()
+    val device = gpu_device(GPU_SHADERFORMAT_MSL).expect("Metal device")
+    val compiled = pipeline(device)
+
+    _ = compiled
+end shader_pipeline

@@ -1,0 +1,191 @@
+module sh.sysl.rheos
+@tests
+
+import sh.sysl.quaternion.Quaternion
+
+private val zero_exotic = Vec3(0.0, 0.0, 0.0)
+private near_exotic(a: real, b: real, tolerance: real = 1e-8) =
+    assert((a-b).abs() < tolerance, s"expected ${b}, got ${a}")
+
+private tetrahedron() -> &Hull = hull([Vec3(0.0,0.0,0.0), Vec3(1.0,0.0,0.0), Vec3(0.0,2.0,0.0), Vec3(0.0,0.0,3.0)],
+    [[0,2,1], [0,1,3], [0,3,2], [1,2,3]]).unwrap()
+
+private cube_hull() -> &Hull = hull([
+    Vec3(-0.5,-0.5,-0.5), Vec3(0.5,-0.5,-0.5), Vec3(0.5,0.5,-0.5), Vec3(-0.5,0.5,-0.5),
+    Vec3(-0.5,-0.5,0.5), Vec3(0.5,-0.5,0.5), Vec3(0.5,0.5,0.5), Vec3(-0.5,0.5,0.5)],
+    [[0,2,1],[0,3,2], [4,5,6],[4,6,7], [0,4,7],[0,7,3], [1,2,6],[1,6,5], [3,7,6],[3,6,2], [0,1,5],[0,5,4]]).unwrap()
+
+@test("scalene tetrahedron volume, centroid and full inertia match exact volume integrals")
+tetra_mass()
+    val h = tetrahedron()
+
+    near_exotic(h.volume, 1.0)
+    assert_eq(h.centre, Vec3(0.25,0.5,0.75))
+    near_exotic(h.unit_inertia.x, 39.0/80.0)
+    near_exotic(h.unit_inertia.y, 30.0/80.0)
+    near_exotic(h.unit_inertia.z, 15.0/80.0)
+    near_exotic(h.unit_inertia.xy, 2.0/80.0)
+    near_exotic(h.unit_inertia.xz, 3.0/80.0)
+    near_exotic(h.unit_inertia.yz, 6.0/80.0)
+end tetra_mass
+
+@test("hull mass properties match the existing analytic cube")
+cube_mass()
+    val h = cube_hull()
+    val b = cuboid(zero_exotic, zero_exotic, Vec3(0.5,0.5,0.5))
+
+    near_exotic(h.volume, 1.0)
+    near_exotic(h.centre.length(), 0.0)
+    near_exotic(h.unit_inertia.x, b.inertia().x)
+    near_exotic(h.unit_inertia.xy, 0.0)
+
+@test("hull validation rejects open meshes, inward faces and bad indices")
+invalid_hulls()
+    val v = [Vec3(0.0,0.0,0.0), Vec3(1.0,0.0,0.0), Vec3(0.0,1.0,0.0), Vec3(0.0,0.0,1.0)]
+
+    assert(hull(v, [[0,1,2], [0,1,3], [0,3,2], [1,2,3]]).is_err())
+    assert(hull(v, [[0,2,1], [0,1,3], [0,3,2], [1,2,4]]).is_err())
+    assert(hull(v, [[0,2,1], [0,1,3], [0,3,2], [0,3,2]]).is_err())
+
+@test("full symmetric inertia inverse recovers a vector")
+full_inverse()
+    val i = tetrahedron().unit_inertia
+    val v = Vec3(1.3,-0.7,2.1)
+    val result = i.inverse().times(i.times(v))
+
+    near_exotic((result-v).length(), 0.0)
+
+@test("irregular torque-free tumbling preserves energy and world angular momentum")
+irregular_tumble()
+    var b = convex(zero_exotic, zero_exotic, tetrahedron(), angular_velocity = Vec3(0.7,-1.2,2.0))
+    val energy = b.kinetic_energy()
+    val momentum = b.angular_momentum()
+
+    for _ in 0..<2000 do b = integrate(b, 0.001)
+    near_exotic(b.kinetic_energy(), energy)
+    near_exotic((b.angular_momentum()-momentum).length(), 0.0)
+
+@test("ellipsoid support lies on its actual surface and maximises the direction")
+ellipsoid_support()
+    val b = ellipsoid(zero_exotic, zero_exotic, Vec3(2.0,1.0,0.5))
+    val direction = Vec3(0.3,-0.5,0.7).unit()
+    val p = b.support(direction)
+
+    near_exotic(p.x*p.x/4.0 + p.y*p.y + p.z*p.z/0.25, 1.0)
+    near_exotic(p.dot(direction), Vec3(2.0,1.0,0.5).times(direction).length())
+    near_exotic(b.inertia().x, 0.25)
+    near_exotic(b.inertia().y, 0.85)
+    near_exotic(b.inertia().z, 1.0)
+end ellipsoid_support
+
+@test("ellipsoid projection respects its quaternion")
+ellipsoid_projection()
+    val q = Quaternion.from_axis_angle([0.0,0.0,1.0], 1.5707963267948966)
+    val b = ellipsoid(zero_exotic, zero_exotic, Vec3(2.0,1.0,0.5), orientation = q)
+
+    near_exotic(b.extent(Vec3(1.0,0.0,0.0)), 1.0)
+    near_exotic(b.extent(Vec3(0.0,1.0,0.0)), 2.0)
+
+@test("EPA ellipsoid depth agrees with the analytic axial overlap")
+ellipsoid_overlap()
+    val a = ellipsoid(zero_exotic, zero_exotic, Vec3(1.0,0.5,0.3))
+    val b = ellipsoid(Vec3(0.0,0.9,0.0), zero_exotic, Vec3(1.0,0.5,0.3))
+    val m = contacts_checked(a,b).unwrap()
+
+    assert_eq(m.count, 1)
+    near_exotic(m.depth, 0.1, 1e-4)
+    assert(m.normal.y > 0.999)
+
+@test("GJK rejects separated ellipsoids with overlapping bounding spheres")
+ellipsoid_separation()
+    val a = ellipsoid(zero_exotic, zero_exotic, Vec3(1.0,0.2,0.2))
+    val b = ellipsoid(Vec3(0.0,0.6,0.0), zero_exotic, Vec3(1.0,0.2,0.2))
+
+    assert_eq(contacts_checked(a,b).unwrap().count, 0)
+
+@test("GJK and EPA on convex cube meshes agree with the box SAT oracle")
+convex_sat_oracle()
+    val h = cube_hull()
+
+    for i in 0..<12
+        val q = Quaternion.from_euler(real(i)*0.13, real(i)*0.07, real(i)*-0.11)
+        val p = Vec3(0.7+real(i)*0.045, 0.15, 0.1)
+        val a = cuboid(zero_exotic, zero_exotic, Vec3(0.5,0.5,0.5))
+        val b = cuboid(p, zero_exotic, Vec3(0.5,0.5,0.5), orientation = q)
+        val expected = contacts(a,b)
+        val actual = contacts_checked(convex(zero_exotic,zero_exotic,h), convex(p,zero_exotic,h,orientation=q)).unwrap()
+
+        assert((expected.count == 0) == (actual.count == 0))
+        if expected.count > 0 then near_exotic(actual.depth, expected.depth, 1e-4)
+    end for
+end convex_sat_oracle
+
+@test("ellipsoid wall contact is off-centre and changes spin without friction")
+ellipsoid_wall()
+    var b = ellipsoid(zero_exotic, Vec3(2.0,0.0,0.0), Vec3(0.6,0.3,0.2), friction = 0.0,
+                      orientation = Quaternion.from_euler(0.3,0.4,0.5))
+
+    b.position = Vec3(5.0-b.extent(Vec3(1.0,0.0,0.0)), 0.0, 0.0)
+    val m = wall_contacts(b, Vec3(5.0,5.0,5.0), 0, 1.0)
+    val (out,_,_) = solve(b,b,m,1.0,true)
+
+    assert(out.angular_velocity.length() > 0.1)
+    near_exotic(out.kinetic_energy(), b.kinetic_energy())
+end ellipsoid_wall
+
+@test("numerically touching convex vertices do not seed a degenerate EPA polytope")
+touching_convex()
+    val mesh = tetrahedron()
+
+    for k in 0..<48
+        val q = Quaternion.from_euler(real(k)*0.13, real(k)*0.37, real(k)*0.19)
+        val a = convex(zero_exotic,zero_exotic,mesh,orientation=q)
+        var b = convex(zero_exotic,zero_exotic,mesh,
+                       orientation=Quaternion.from_euler(real(k)*-0.17,0.3,0.8))
+        val n = Vec3(0.7,0.2,-0.4).unit()
+
+        b.position = a.support(n)-b.support(n * -1.0)
+        val m = contacts_checked(a,b).unwrap()
+
+        assert(m.count == 0 || m.depth < 1e-6)
+    end for
+end touching_convex
+
+@test("sub-tolerance ellipsoid overlaps are touching and larger overlaps remain contacts")
+contact_accuracy()
+    val a = ellipsoid(zero_exotic,zero_exotic,Vec3(0.6,0.5,0.3))
+    val tiny = ellipsoid(Vec3(0.0,0.999999,0.0),zero_exotic,Vec3(0.6,0.5,0.3))
+    val overlap = ellipsoid(Vec3(0.0,0.9995,0.0),zero_exotic,Vec3(0.6,0.5,0.3))
+
+    assert_eq(contacts_checked(a,tiny).unwrap().count,0)
+    val m = contacts_checked(a,overlap).unwrap()
+
+    assert_eq(m.count,1)
+    near_exotic(m.depth,0.0005,2e-5)
+end contact_accuracy
+
+private escaped_hull_vertices() -> []const Vec3 = tetrahedron().vertices()
+
+@test("a geometry view owns its storage after its temporary hull has gone")
+geometry_view_lifetime()
+    val vertices = escaped_hull_vertices()
+    val other = tetrahedron()
+
+    assert_eq(vertices.len,4)
+    near_exotic(vertices[0].x,-0.25)
+    near_exotic(vertices[3].z,2.25)
+    assert_eq(vertices[1],other.vertices()[1])
+
+// Reduced from the user's seed 17727295752622095070, friction off, failing at step 19167.
+@test("the reported long-run box ellipsoid contact terminates")
+reported_box_ellipsoid()
+    val a = cuboid(Vec3(0.2084312544601902,0.6695363563159025,1.1353696971964968),zero_exotic,
+        Vec3(0.46808123908581,0.187232495634324,0.2434022443246212),friction=0.0,
+        orientation=Quaternion(0.59596194470958,-0.5848845253036793,-0.5267973422002924,0.15882069376807773))
+    val b = ellipsoid(Vec3(0.7455707503436002,0.4034595357304757,1.2305122100529704),zero_exotic,
+        Vec3(0.5191847189560629,0.2410500480867435,0.3152192936518953),friction=0.0,
+        orientation=Quaternion(0.09520610686590585,-0.2061687937177576,0.7703764971362407,-0.5957770374666168))
+    val m = contacts_checked(a,b).unwrap()
+
+    assert(m.count == 0 || m.normal.finite() && m.depth >= 0)
+end reported_box_ellipsoid

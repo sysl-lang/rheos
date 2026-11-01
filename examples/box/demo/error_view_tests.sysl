@@ -1,0 +1,22 @@
+module demo
+@tests
+
+import sh.sysl.ui.*
+
+@test("collision errors wrap to the available panel width without dropping words")
+wrapped_diagnostic()
+    var canvas = recorder()
+    val view = wrapped_error("GJK did not converge in 64 iterations")
+
+    assert_eq(view.measure(&canvas,Size(112,200)),Size(112,48))
+    view.paint(&canvas,Rect(0,0,112,48))
+    assert(canvas.dump().contains("GJK did not"))
+    assert(canvas.dump().contains("converge in 64"))
+    assert(canvas.dump().contains("iterations"))
+end wrapped_diagnostic
+
+@test("no collision error takes no panel height")
+empty_diagnostic()
+    var canvas = recorder()
+
+    assert_eq(wrapped_error("").measure(&canvas,Size(252,200)).h,0)

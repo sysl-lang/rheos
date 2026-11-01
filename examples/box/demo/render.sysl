@@ -1,0 +1,179 @@
+module demo
+
+import sh.sysl.rheos.*
+import sh.sysl.ui_sdl.*
+import sh.sysl.sdl3.{GpuDevice, GpuPipeline, GPU_SHADERFORMAT_MSL, GPU_SHADERSTAGE_VERTEX, GPU_SHADERSTAGE_FRAGMENT}
+import sysl.raw.ptr_cast
+
+private val shaders = raw"""
+#include <metal_stdlib>
+using namespace metal;
+struct Uniforms {
+    float4 camera;
+    float4 centre;
+    float4 rotation;
+    float4 tint;
+    float4 extent;
+    float4 light;
+    float4 triangle_a;
+    float4 triangle_b;
+    float4 triangle_c;
+};
+struct Out {
+    float4 position [[position]];
+    float3 world_position;
+    float3 world_normal;
+    float4 albedo;
+    float illuminated;
+};
+constant float3 corners[8] = {
+    float3(-1,-1,-1),float3(1,-1,-1),float3(1,1,-1),float3(-1,1,-1),
+    float3(-1,-1,1),float3(1,-1,1),float3(1,1,1),float3(-1,1,1)
+};
+constant uint faces[36] = {
+    0,1,2,0,2,3, 5,4,7,5,7,6, 4,0,3,4,3,7,
+    1,5,6,1,6,2, 3,2,6,3,6,7, 4,5,1,4,1,0
+};
+constant uint2 triangle_offsets[6] = {uint2(0,0),uint2(1,0),uint2(1,1),uint2(0,0),uint2(1,1),uint2(0,1)};
+float3 rotate(float3 p,float4 q) { return p+2.0*cross(q.xyz,cross(q.xyz,p)+q.w*p); }
+vertex Out vertex_main(uint id [[vertex_id]],constant Uniforms& u [[buffer(0)]]) {
+    float kind=u.extent.w;
+    float3 p;
+    float3 normal=float3(0,1,0);
+    float stripe=1.0;
+    if (kind < 0.5 || (kind > 2.5 && kind < 3.5)) {
+        uint cell=id/6;
+        uint2 offset=triangle_offsets[id%6];
+        float longitude=float(cell%32+offset.x)/32.0*6.28318530718;
+        float latitude=float(cell/32+offset.y)/20.0*3.14159265359;
+        float3 local=float3(sin(latitude)*cos(longitude),cos(latitude),sin(latitude)*sin(longitude));
+        float3 radii=kind < 0.5 ? float3(u.centre.w) : u.extent.xyz;
+        p=rotate(local*radii,u.rotation);
+        normal=rotate(normalize(local/radii),u.rotation);
+        stripe=abs(local.y)<0.09 || (abs(local.z)<0.065 && local.x>0) ? 0.32 : 1.0;
+    } else if (kind > 3.5) {
+        float3 local=id==0 ? u.triangle_a.xyz : id==1 ? u.triangle_b.xyz : u.triangle_c.xyz;
+        p=rotate(local,u.rotation);
+        normal=rotate(normalize(cross(u.triangle_b.xyz-u.triangle_a.xyz,u.triangle_c.xyz-u.triangle_a.xyz)),u.rotation);
+    } else {
+        float3 local=corners[faces[id]]*u.extent.xyz;
+        p=kind>1.5 ? rotate(local,u.rotation) : local;
+        uint side=id/6;
+        normal=side<2 ? float3(0,0,side==0 ? -1 : 1) :
+               side<4 ? float3(side==2 ? -1 : 1,0,0) : float3(0,side==4 ? 1 : -1,0);
+        if (kind>1.5) normal=rotate(normal,u.rotation);
+    }
+    p+=u.centre.xyz;
+    Out out;
+    out.world_position=p;
+    out.world_normal=normal;
+    out.albedo=float4(u.tint.rgb*stripe,1.0);
+    out.illuminated=kind>0.5 && kind<1.5 ? 0.0 : 1.0;
+    float cy=cos(u.camera.x),sy=sin(u.camera.x),cx=cos(u.camera.y),sx=sin(u.camera.y);
+    p=float3(cy*p.x+sy*p.z,p.y,cy*p.z-sy*p.x);
+    p=float3(p.x,cx*p.y-sx*p.z,sx*p.y+cx*p.z);
+    float z=p.z+u.camera.z;
+    float near=0.1,far=100.0;
+    out.position=float4(p.x*2.0/u.camera.w,p.y*2.0,far/(far-near)*(z-near),z);
+    return out;
+}
+fragment float4 fragment_main(Out in [[stage_in]],constant Uniforms& u [[buffer(0)]]) {
+    if (in.illuminated<0.5) return in.albedo;
+    float3 to_light=u.light.xyz-in.world_position;
+    float squared_distance=max(dot(to_light,to_light),0.001);
+    float cosine=max(0.0,dot(normalize(in.world_normal),normalize(to_light)));
+    float irradiance=0.07+u.light.w*cosine/squared_distance;
+    return float4(in.albedo.rgb*irradiance,1.0);
+}
+"""
+
+private struct Uniforms
+    camera: [4]f32
+    centre: [4]f32
+    rotation: [4]f32
+    tint: [4]f32
+    extent: [4]f32
+    light: [4]f32
+    triangle_a: [4]f32
+    triangle_b: [4]f32
+    triangle_c: [4]f32
+
+pipeline(device: &GpuDevice) -> &GpuPipeline
+    val vs = device.shader(shaders, GPU_SHADERFORMAT_MSL, GPU_SHADERSTAGE_VERTEX, "vertex_main",
+                           uniform_buffers = 1).expect("body vertex shader")
+    val fs = device.shader(shaders, GPU_SHADERFORMAT_MSL, GPU_SHADERSTAGE_FRAGMENT,
+                           "fragment_main", uniform_buffers = 1).expect("body fragment shader")
+
+    device.pipeline(vs, fs, [], [], VIEWPORT_COLOR_FORMAT,
+                    depth_format = viewport_depth_format(device)).expect("body pipeline")
+end pipeline
+
+private val colours: [][4]f32 = [
+    [0.25, 0.78, 0.91, 1.0], [1.0, 0.57, 0.27, 1.0], [0.63, 0.52, 0.96, 1.0],
+    [0.42, 0.86, 0.63, 1.0], [0.98, 0.78, 0.35, 1.0], [0.96, 0.43, 0.55, 1.0]]
+
+draw(f: ViewportFrame, pipe: &GpuPipeline, bodies: []Body, yaw: real, tilt: real, distance: real)
+    val pass = f.pass(0.035, 0.05, 0.08).unwrap()
+
+    pass.bind_pipeline(pipe)
+    var u = Uniforms([f32(yaw), f32(tilt), f32(distance), f32(f.rect.w) / f32(f.rect.h)],
+                     [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0],
+                     [0.0, 0.0, 0.0, 0.0], [-3.5, 4.0, -4.0, 28.0],
+                     [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
+
+    for i in 0..<bodies.len
+        val b = bodies[i]
+        val q = b.orientation
+
+        u.centre = [f32(b.position.x), f32(b.position.y), f32(b.position.z), f32(b.radius)]
+        u.rotation = [f32(q.x), f32(q.y), f32(q.z), f32(q.w)]
+        u.tint = colours[i % colours.len]
+        u.extent = if b.shape == Shape.Sphere then [0.0,0.0,0.0,0.0] else
+            [f32(b.half_size.x),f32(b.half_size.y),f32(b.half_size.z),
+             if b.shape == Shape.Box then 2.0 elif b.shape == Shape.Ellipsoid then 3.0 else 4.0]
+        if b.shape == Shape.Convex
+            b.mesh match
+                Some(mesh) ->
+                    val vertices = mesh.vertices()
+
+                    for face in mesh.faces()
+                        val a = vertices[face[0]]
+                        val b = vertices[face[1]]
+                        val c = vertices[face[2]]
+
+                        u.triangle_a = [f32(a.x),f32(a.y),f32(a.z),0.0]
+                        u.triangle_b = [f32(b.x),f32(b.y),f32(b.z),0.0]
+                        u.triangle_c = [f32(c.x),f32(c.y),f32(c.z),0.0]
+                        f.cmd.push_vertex_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+                        f.cmd.push_fragment_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+                        pass.draw(3)
+                    end for
+                None -> ()
+        else
+            f.cmd.push_vertex_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+            f.cmd.push_fragment_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+            pass.draw(if b.shape == Shape.Box then 36 else 32*20*6)
+    end for
+
+    // Twelve narrow bars outline the enclosure without hiding its contents.
+    val h = enclosure.half_size.array()
+
+    u.tint = [0.29, 0.43, 0.57, 1.0]
+    for axis in 0..<3
+        for a in [-1.0, 1.0]
+            for b in [-1.0, 1.0]
+                var p: [4]f32 = [0.0, 0.0, 0.0, 1.0]
+                var ext: [4]f32 = [0.012, 0.012, 0.012, 1.0]
+
+                p[(axis + 1) % 3] = f32(a * h[(axis + 1) % 3])
+                p[(axis + 2) % 3] = f32(b * h[(axis + 2) % 3])
+                ext[axis] = f32(h[axis])
+                u.centre = p
+                u.extent = ext
+                f.cmd.push_vertex_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+                f.cmd.push_fragment_uniforms(0, ptr_cast(&u), u32(sizeof(Uniforms)))
+                pass.draw(36)
+    end for
+
+    pass.finish()
+end draw

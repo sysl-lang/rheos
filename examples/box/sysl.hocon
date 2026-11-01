@@ -1,0 +1,18 @@
+package {
+  name = "rheos-box"
+  version = "0.0.1"
+  sysl = "0.8.11"
+}
+
+optimization = "2"
+
+dependencies {
+  rheos { path = "../.." }
+  syslui-sdl { git = "github.com/sysl-lang/syslui-sdl", version = "0.2.21" }
+}
+
+requires {
+  os = true
+  posix = true
+  heap = true
+}

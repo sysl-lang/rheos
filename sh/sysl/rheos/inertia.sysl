@@ -1,0 +1,33 @@
+module sh.sysl.rheos
+
+import sysl.math.max
+
+// A symmetric 3x3 tensor in body coordinates. Off-diagonal entries matter for irregular solids.
+struct Inertia
+    x: real
+    y: real
+    z: real
+    xy: real
+    xz: real
+    yz: real
+
+    diagonal(self) -> Vec3 = Vec3(self.x, self.y, self.z)
+    times(self, v: Vec3) -> Vec3 = Vec3(self.x * v.x + self.xy * v.y + self.xz * v.z,
+        self.xy * v.x + self.y * v.y + self.yz * v.z, self.xz * v.x + self.yz * v.y + self.z * v.z)
+    scaled(self, s: real) -> Inertia = Inertia(self.x*s, self.y*s, self.z*s, self.xy*s, self.xz*s, self.yz*s)
+    determinant(self) -> real = self.x * (self.y*self.z - self.yz*self.yz) -
+        self.xy * (self.xy*self.z - self.xz*self.yz) + self.xz * (self.xy*self.yz - self.xz*self.y)
+    inverse(self) -> Inertia
+        val d = self.determinant()
+
+        Inertia((self.y*self.z-self.yz*self.yz)/d, (self.x*self.z-self.xz*self.xz)/d,
+                (self.x*self.y-self.xy*self.xy)/d, (self.xz*self.yz-self.xy*self.z)/d,
+                (self.xy*self.yz-self.xz*self.y)/d, (self.xy*self.xz-self.x*self.yz)/d)
+    norm_bound(self) -> real = max(self.x.abs()+self.xy.abs()+self.xz.abs(),
+        max(self.y.abs()+self.xy.abs()+self.yz.abs(), self.z.abs()+self.xz.abs()+self.yz.abs()))
+    smallest_bound(self) -> real = 1.0 / self.inverse().norm_bound()
+    finite(self) -> bool = self.diagonal().finite() && self.xy.is_finite() && self.xz.is_finite() && self.yz.is_finite()
+    positive(self) -> bool = self.x > 0 && self.x*self.y-self.xy*self.xy > 0 && self.determinant() > 0
+end Inertia
+
+private[rheos] diagonal_inertia(v: Vec3) -> Inertia = Inertia(v.x, v.y, v.z, 0.0, 0.0, 0.0)

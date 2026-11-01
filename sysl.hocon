@@ -1,0 +1,9 @@
+package {
+  name = "rheos"
+  version = "0.0.1"
+  sysl = "0.8.11"
+}
+
+dependencies {
+  quaternion { git = "github.com/sysl-lang/quaternion", version = "0.1.0" }
+}

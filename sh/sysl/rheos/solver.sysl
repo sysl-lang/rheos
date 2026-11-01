@@ -1,0 +1,114 @@
+module sh.sysl.rheos
+
+import sysl.math.{min, max}
+
+private zero_vector() -> Vec3 = Vec3(0.0, 0.0, 0.0)
+
+private apply(b: Body, impulse: Vec3, arm: Vec3) -> Body
+    var out = b
+    val torque = b.unrotate(arm.cross(impulse))
+    val inertia = b.inertia()
+
+    out.velocity = b.velocity + impulse * (1.0 / b.mass)
+    out.angular_velocity = b.angular_velocity + inertia.inverse().times(torque)
+    out
+end apply
+
+private relative_velocity(a: Body, b: Body, ra: Vec3, rb: Vec3, wall: bool) -> Vec3 =
+    (if wall then zero_vector() else b.point_velocity(rb)) - a.point_velocity(ra)
+
+// u.K.v for the contact's effective inverse mass, including both world inertia tensors.
+private effective(a: Body, b: Body, ra: Vec3, rb: Vec3, u: Vec3, v: Vec3, wall: bool) -> real
+    var response = v * (1.0 / a.mass) + a.inverse_inertia(ra.cross(v)).cross(ra)
+
+    if !wall
+        response = response + v * (1.0 / b.mass) + b.inverse_inertia(rb.cross(v)).cross(rb)
+    u.dot(response)
+end effective
+
+// Accumulated normal impulses, then a two-dimensional Coulomb friction disk. Restitution uses
+// pre-solve contact velocities, not the changing velocities from earlier solver iterations.
+// Reference: Erin Catto, Sequential Impulses (GDC 2006), and Box2D's contact_solver.c.
+private[rheos] solve(a: Body, b: Body, m: Manifold, restitution: real, wall: bool = false) -> (Body, Body, int)
+    if m.count == 0 then return (a, b, 0)
+    val n = m.normal
+    val t1 = n.cross(if n.x.abs() < 0.7 then Vec3(1.0, 0.0, 0.0) else Vec3(0.0, 1.0, 0.0)).unit()
+    val t2 = n.cross(t1)
+    val friction = if wall then a.friction else (a.friction * b.friction).sqrt()
+    var left = a
+    var right = b
+    var arms_a: [8]Vec3
+    var arms_b: [8]Vec3
+    var normal_mass: [8]real
+    var target: [8]real
+    var normal_impulse: [8]real
+    var tangent_impulse: [8]Vec3
+
+    for k in 0..<m.count
+        arms_a[k] = m.points[k] - a.position
+        arms_b[k] = m.points[k] - b.position
+        normal_mass[k] = 1.0 / effective(a, b, arms_a[k], arms_b[k], n, n, wall)
+        target[k] = -restitution * min(0.0, relative_velocity(a, b, arms_a[k], arms_b[k], wall).dot(n))
+    end for
+
+    for _ in 0..<(if m.count == 1 then 1 else 24)
+        for k in 0..<m.count
+            val ra = arms_a[k]
+            val rb = arms_b[k]
+            val speed = relative_velocity(left, right, ra, rb, wall).dot(n)
+            val accumulated = max(0.0, normal_impulse[k] + (target[k] - speed) * normal_mass[k])
+            val impulse = n * (accumulated - normal_impulse[k])
+
+            normal_impulse[k] = accumulated
+            left = apply(left, impulse * -1.0, ra)
+            if !wall then right = apply(right, impulse, rb)
+    end for
+
+    if friction > 0
+        // Friction follows the normal solve so each friction update minimises tangential energy.
+        for _ in 0..<(if m.count == 1 then 1 else 8)
+            for k in 0..<m.count
+                val ra = arms_a[k]
+                val rb = arms_b[k]
+                val velocity = relative_velocity(left, right, ra, rb, wall)
+                val k11 = effective(a, b, ra, rb, t1, t1, wall)
+                val k12 = effective(a, b, ra, rb, t1, t2, wall)
+                val k22 = effective(a, b, ra, rb, t2, t2, wall)
+                val v1 = velocity.dot(t1)
+                val v2 = velocity.dot(t2)
+                // A projected gradient step with the largest tangent eigenvalue is dissipative
+                // even for anisotropic inertia when the friction disk clamps the result.
+                val largest = 0.5 * (k11 + k22 + ((k11 - k22) * (k11 - k22) + 4.0 * k12 * k12).sqrt())
+                val delta = (t1 * -v1 + t2 * -v2) * (1.0 / largest)
+                var accumulated = tangent_impulse[k] + delta
+                val limit = friction * normal_impulse[k]
+                val length = accumulated.length()
+
+                if length > limit then accumulated = accumulated * (limit / length)
+                val impulse = accumulated - tangent_impulse[k]
+
+                tangent_impulse[k] = accumulated
+                left = apply(left, impulse * -1.0, ra)
+                if !wall then right = apply(right, impulse, rb)
+        end for
+    end if
+
+    var hits = 0
+
+    for k in 0..<m.count
+        if normal_impulse[k] > 1e-12 then hits += 1
+    (left, right, hits)
+end solve
+
+private[rheos] resolve(a: Body, b: Body, m: Manifold, restitution: real) -> (Body, Body, int)
+    val (solved_a, solved_b, hits) = solve(a, b, m, restitution)
+    var left = solved_a
+    var right = solved_b
+    val ia = 1.0 / a.mass
+    val ib = 1.0 / b.mass
+    val correction = m.normal * (m.depth / (ia + ib))
+
+    left.position = left.position - correction * ia
+    right.position = right.position + correction * ib
+    (left, right, hits)
+end resolve

@@ -1,0 +1,124 @@
+module demo
+
+import sh.sysl.rheos.*
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+import sh.sysl.quaternion.Quaternion
+
+val enclosure = Enclosure(Vec3(3.0, 2.3, 2.3), 1.0)
+
+struct SeedSequence
+    stream: Rng
+    last_seed: u64
+
+    next_seed(*self) -> u64
+        loop
+            val candidate = self.stream.next_u64()
+
+            if candidate != self.last_seed
+                self.last_seed = candidate
+                return candidate
+    end next_seed
+end SeedSequence
+
+seed_sequence(initial: u64) -> SeedSequence = SeedSequence(rng(initial,87), initial)
+
+private random_vector(random: *Rng, size: real) -> Vec3 =
+    Vec3(random.unit()*2.0-1.0, random.unit()*2.0-1.0, random.unit()*2.0-1.0)*size
+
+private random_rotation(random: *Rng) -> Quaternion[real]
+    val u = random.unit()
+    val a = random.unit()*6.283185307179586
+    val b = random.unit()*6.283185307179586
+
+    Quaternion(u.sqrt()*b.cos(), (1.0-u).sqrt()*a.sin(), (1.0-u).sqrt()*a.cos(), u.sqrt()*b.sin())
+
+private irregular(random: *Rng, size: real, wedge: bool) -> &Hull
+    val vertices: Buf[Vec3] = buf()
+    val faces: Buf[[3]int] = buf()
+
+    if wedge
+        val base = [Vec3(-0.6,-0.3,-0.45), Vec3(0.7,-0.25,-0.45), Vec3(-0.15,0.6,-0.45)]
+        val shift = random_vector(random, 0.1)
+
+        for v in base do vertices.push(v*size)
+        for v in base do vertices.push(Vec3(v.x*0.65+0.14+shift.x, v.y*0.65+0.05+shift.y, 0.45)*size)
+        for f in [[0,2,1], [3,4,5], [0,1,4], [0,4,3], [1,2,5], [1,5,4], [2,0,3], [2,3,5]]
+            faces.push(f)
+    else
+        for v in [Vec3(-0.7,-0.45,-0.4), Vec3(0.85,-0.3,-0.25), Vec3(-0.2,0.8,-0.15), Vec3(-0.1,0.0,0.85)]
+            vertices.push((v+random_vector(random, 0.1))*size)
+        for f in [[0,1,2], [0,3,1], [0,2,3], [1,3,2]] do faces.push(f)
+    end if
+
+    var middle = Vec3(0.0,0.0,0.0)
+
+    for p in vertices.view() do middle = middle + p*(1.0/real(vertices.len()))
+    for k in 0..<faces.len()
+        var f = faces[k]
+        val a = vertices[f[0]]
+        val n = (vertices[f[1]]-a).cross(vertices[f[2]]-a)
+
+        if n.dot(middle-a) > 0
+            val swap = f[1]
+
+            f[1] = f[2]
+            f[2] = swap
+        faces[k] = f
+    end for
+
+    hull(vertices.view(), faces.view()).expect("generated convex geometry")
+end irregular
+
+// A seed completely determines a scene; the application supplies fresh seeds for Reset.
+scene(mixed: bool = true, rough: bool = true, seed: u64 = 42) -> Buf[Body]
+    val bodies: Buf[Body] = buf()
+    var random = rng(seed, 54)
+
+    for i in 0..<24
+        val v = random_vector(&random, 1.8)
+        val r = 0.28+random.unit()*0.1
+        val spin = if mixed && i%2 == 0 then Vec3(0.0,0.0,0.0) else random_vector(&random, 1.2)
+        val friction = if rough then 0.2 else 0.0
+        val mass = 1.0+random.unit()*3.0
+        val orientation = random_rotation(&random)
+        val origin = Vec3(0.0,0.0,0.0)
+        var b = sphere(origin, v, r, mass, spin, friction)
+
+        if mixed
+            if i%6 == 1
+                b = cuboid(origin,v,Vec3(r*0.75,r*0.75,r*0.75),mass,spin,friction,orientation)
+            elif i%6 == 2
+                b = cuboid(origin,v,Vec3(r*1.25,r*0.5,r*0.65),mass,spin,friction,orientation)
+            elif i%6 == 3
+                b = ellipsoid(origin,v,Vec3(r*1.4,r*0.65,r*0.85),mass,spin,friction,orientation)
+            elif i%6 >= 4
+                b = convex(origin,v,irregular(&random,r*1.3,i%6 == 5),mass,spin,friction,orientation)
+        end if
+
+        var placed = false
+        var tries = 0
+
+        while !placed && tries < 2000
+            val unit = random_vector(&random, 1.0)
+            val h = enclosure.half_size-Vec3(b.radius+0.08,b.radius+0.08,b.radius+0.08)
+
+            b.position = unit.times(h)
+            placed = true
+            for other in bodies.view()
+                if (b.position-other.position).length() < b.radius+other.radius+0.08 then placed = false
+            tries += 1
+        end while
+
+        assert(placed, "could not place a non-overlapping seeded scene")
+        bodies.push(b)
+    end for
+
+    bodies
+end scene
+
+energy(bodies: []Body) -> real
+    var total = 0.0
+
+    for b in bodies do total += b.kinetic_energy()
+    total

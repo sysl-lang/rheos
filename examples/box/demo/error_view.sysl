@@ -1,0 +1,45 @@
+module demo
+
+import sh.sysl.ui.*
+import sysl.buf.{Buf, buf}
+import sysl.text.fields
+import sysl.math.max
+
+// Collision diagnostics must fit the panel instead of silently disappearing at its right edge.
+private error_lines(message: string, canvas: *Canvas, width: int) -> Buf[string]
+    val lines: Buf[string] = buf()
+    var current = ""
+
+    for word in fields(message)
+        val candidate = if current == "" then word else current+" "+word
+
+        if current != "" && canvas.text_size(candidate).w > width
+            lines.push(current)
+            current = word
+        else
+            current = candidate
+    end for
+
+    if current != "" then lines.push(current)
+    lines
+end error_lines
+
+private struct WrappedError
+    message: string
+
+impl View for WrappedError
+    measure(&self, canvas: *Canvas, available: Size) -> Size
+        val width = max(1,available.w)
+        val lines = error_lines(self.message,canvas,width)
+
+        Size(width,int(lines.len())*canvas.text_size("Ag").h)
+
+    paint(&self, canvas: *Canvas, rect: Rect)
+        val lines = error_lines(self.message,canvas,rect.w)
+        val height = canvas.text_size("Ag").h
+
+        for k in 0..<lines.len()
+            canvas.text(Rect(rect.x,rect.y+int(k)*height,rect.w,height),lines[k])
+    end paint
+
+wrapped_error(message: string) -> &View = WrappedError(message)

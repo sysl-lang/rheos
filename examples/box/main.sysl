@@ -1,0 +1,187 @@
+import demo.*
+import sh.sysl.rheos.*
+import sh.sysl.ui.*
+import sh.sysl.ui_sdl.*
+import sh.sysl.sdl3.{GpuPipeline, GPU_SHADERFORMAT_MSL}
+import sysl.text.{parse_int, parse_ulong}
+import sysl.posix.rand.seed_from_os
+import sysl.math.{min, max}
+
+main(args: []string) -> Result[unit, string]
+    var frames = 0
+    var simulate = 0
+    var shot = ""
+    var control = ""
+    var hidden = false
+    var friction_enabled = true
+    var chosen_seed: Option[u64] = None
+    var i = 1
+
+    while i < args.len
+        val flag = args[i]
+
+        if flag == "--hidden"
+            hidden = true
+        elif flag == "--no-friction"
+            friction_enabled = false
+        else
+            if i + 1 >= args.len then return Err(s"missing value for ${flag}")
+            i += 1
+            val value = args[i]
+
+            if flag == "--frames" || flag == "--simulate"
+                val count = parse_int(value).unwrap_or(0)
+
+                if count <= 0 then return Err(s"${flag} needs a positive integer")
+                if flag == "--frames" then frames = count else simulate = count
+            elif flag == "--seed"
+                parse_ulong(value) match
+                    Ok(seed) -> chosen_seed = Some(seed)
+                    Err(_) -> return Err("--seed needs an unsigned 64-bit integer")
+            elif flag == "--shot" then shot = value
+            elif flag == "--control" then control = value
+            else return Err(s"unknown argument ${flag}")
+        i += 1
+    end while
+
+    if shot != "" && frames <= 0 then return Err("--shot needs --frames")
+
+    val initial_seed = chosen_seed match
+        Some(value) -> value
+        None -> seed_from_os() match
+            Some(value) -> value
+            None -> return Err("OS entropy unavailable; specify --seed")
+
+    print(s"Rheos scene seed: ${initial_seed}")
+    if simulate > 0
+        val bodies = scene(rough = friction_enabled,seed = initial_seed)
+        val before = energy(bodies.view())
+
+        for tick in 0..<simulate
+            step(bodies.view(),enclosure,1.0/120.0) match
+                Ok(_) -> ()
+                Err(message) -> return Err(s"step ${tick+1}: ${message}")
+        print(s"${simulate} steps, energy before ${before}, after ${energy(bodies.view())}")
+        return Ok(())
+
+    val mixed = signal(true)
+    val rough = signal(friction_enabled)
+    val seed = signal(initial_seed)
+    val seed_stream = signal(seed_sequence(initial_seed))
+    val bodies = signal(scene(rough = friction_enabled,seed = initial_seed))
+    val paused = signal(false)
+    val slow = signal(false)
+    val yaw = signal(0.45)
+    val tilt = signal(-0.27)
+    val distance = signal(12.0)
+    val made = signal[Option[&GpuPipeline]](None)
+    val ticks = signal(0)
+    val impacts = signal(0)
+    val error = signal("")
+    val accumulator = signal(0.0)
+    val elapsed_frames = signal(0)
+
+    val advance: &Fn() -> unit = () ->
+        step(bodies.read().view(), enclosure, 1.0 / 120.0) match
+            Ok(stats) ->
+                ticks.set(ticks.read() + 1)
+                impacts.set(impacts.read() + stats.impulses)
+            Err(message) ->
+                error.set(message)
+                print(s"Simulation paused; seed ${seed.read()}, step ${ticks.read()+1}: ${message}")
+                paused.set(true)
+
+    val view = viewport(f ->
+        val pipe = made.read() match
+            Some(p) -> p
+            None ->
+                val p = pipeline(f.device)
+
+                made.set(Some(p))
+                p
+
+        draw(f, pipe, bodies.read().view(), yaw.read(), tilt.read(), distance.read())
+    , (canvas, rect) ->
+        val (dx, dy) = canvas.drag_by(rect, 1, PointerButton.Primary, 2, 2)
+
+        if dx != 0 then yaw.set(yaw.read() - real(dx) * 0.008)
+        if dy != 0 then tilt.set(max(-1.4, min(1.4, tilt.read() - real(dy) * 0.008)))
+        val (_, wheel) = canvas.wheel(rect)
+
+        if wheel != 0 then distance.set(max(8.0, min(24.0, distance.read() - real(wheel) * 0.03)))
+    )
+
+    val replay: &Fn() -> unit = () ->
+        bodies.set(scene(mixed.read(), rough.read(), seed.read()))
+        ticks.set(0)
+        impacts.set(0)
+        accumulator.set(0.0)
+        error.set("")
+
+    val reset: &Fn() -> unit = () ->
+        var stream = seed_stream.read()
+
+        seed.set(stream.next_seed())
+        seed_stream.set(stream)
+        print(s"Rheos scene seed: ${seed.read()}")
+        replay()
+
+    val toggle_shapes: &Fn() -> unit = () ->
+        mixed.set(!mixed.read())
+        reset()
+
+    val toggle_friction: &Fn() -> unit = () ->
+        rough.set(!rough.read())
+        val storage = bodies.read().view()
+
+        for k in 0..<storage.len
+            storage[k].friction = if rough.read() then 0.2 else 0.0
+
+    val toggle_pause: &Fn() -> unit = () ->
+        paused.set(!paused.read())
+        accumulator.set(0.0)
+
+    val single_step: &Fn() -> unit = () ->
+        paused.set(true)
+        advance()
+
+    val tree: &Fn() -> &View = () ->
+        val panel = column([
+            text("RHEOS").font_size(30.0),
+            text("Motion, from sysl.").font_size(17.0),
+            text(if mixed.read() then "Spheres, boxes, ellipsoids, hulls" else "24 spheres / zero gravity"),
+            text("6 x 4.6 x 4.6 metres"),
+            button(if paused.read() then "Resume" else "Pause", toggle_pause).named("pause"),
+            button("Single step", single_step).named("step"),
+            button(if slow.read() then "Normal speed" else "Slow motion", () -> slow.set(!slow.read())).named("speed"),
+            row([button("New scene", reset).named("reset"), button("Replay", replay).named("replay")]),
+            button(if mixed.read() then "Switch to spheres" else "Switch to mixed shapes", toggle_shapes).named("shapes"),
+            button(if rough.read() then "Friction: on" else "Friction: off", toggle_friction).named("friction"),
+            text(s"Seed: ${seed.read()}"),
+            text(s"Physics steps: ${ticks.read()}"),
+            text(s"Collision impulses: ${impacts.read()}"),
+            text(f"Energy: ${energy(bodies.read().view())}%.2f J"),
+            wrapped_error(error.read()),
+            spacer().flex(),
+            text("Drag to orbit. Scroll to zoom."),
+            text(if rough.read() then "Friction transfers motion to spin." else "Frictionless elastic collisions."),
+            text("Physics: sh.sysl.rheos"),
+        ], 10).padding(24).frame(300, 0).background(0x182331u32)
+
+        row([view.flex(), panel])
+
+    run(app("Rheos — floating bodies", tree, () -> 0x090D14u32, 1280, 800,
+            gpu = GPU_SHADERFORMAT_MSL, control = control, hidden = hidden, on_frame = dt ->
+        if !paused.read()
+            val delta = if frames > 0 then 1.0 / 60.0 else min(dt, 0.1)
+
+            accumulator.set(accumulator.read() + delta * (if slow.read() then 0.2 else 1.0))
+            while accumulator.read() >= 1.0 / 120.0 && !paused.read()
+                advance()
+                accumulator.set(accumulator.read() - 1.0 / 120.0)
+
+        elapsed_frames.set(elapsed_frames.read() + 1)
+        if frames > 0 && elapsed_frames.read() == frames && shot != "" then save_frame(shot)
+        if frames > 0 && elapsed_frames.read() > frames then stop()
+    ))
+end main

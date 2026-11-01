@@ -1,0 +1,254 @@
+module sh.sysl.rheos
+@tests
+
+import sh.sysl.quaternion.Quaternion
+
+private val origin = Vec3(0.0, 0.0, 0.0)
+private val half = Vec3(0.5, 0.5, 0.5)
+private near_rotation(a: real, b: real, tolerance: real = 1e-8) =
+    assert((a - b).abs() < tolerance, s"expected ${b}, got ${a}")
+private near_vector(a: Vec3, b: Vec3, tolerance: real = 1e-8)
+    near_rotation(a.x, b.x, tolerance)
+    near_rotation(a.y, b.y, tolerance)
+    near_rotation(a.z, b.z, tolerance)
+
+private total_angular(a: Body, b: Body) -> Vec3 =
+    a.angular_momentum() + b.angular_momentum() +
+    a.position.cross(a.velocity * a.mass) + b.position.cross(b.velocity * b.mass)
+
+@test("sphere wall friction matches the analytical impulse and spin")
+sphere_wall_spin()
+    val a = sphere(origin, Vec3(2.0, -1.0, 0.0), 0.5, friction = 0.5)
+    var points: [8]Vec3
+
+    points[0] = Vec3(0.0, -0.5, 0.0)
+    val m = Manifold(Vec3(0.0, -1.0, 0.0), 0.0, points, 1)
+    val (b, _, hits) = solve(a, a, m, 1.0, true)
+
+    assert_eq(hits, 1)
+    near_rotation(b.velocity.x, 10.0 / 7.0)
+    near_rotation(b.velocity.y, 1.0)
+    near_rotation(b.angular_velocity.z, -20.0 / 7.0)
+    assert(b.kinetic_energy() < a.kinetic_energy())
+end sphere_wall_spin
+
+@test("Coulomb friction clamps the tangential impulse")
+friction_limit()
+    val a = sphere(origin, Vec3(20.0, -1.0, 0.0), 0.5, friction = 0.1)
+    var points: [8]Vec3
+
+    points[0] = Vec3(0.0, -0.5, 0.0)
+    val (b, _, _) = solve(a, a, Manifold(Vec3(0.0, -1.0, 0.0), 0.0, points, 1), 1.0, true)
+
+    near_rotation(b.velocity.x, 19.8)
+    near_rotation(b.angular_velocity.z, -1.0)
+
+@test("rough sphere collisions conserve linear and angular momentum while losing energy")
+rough_spheres()
+    val a = sphere(Vec3(-0.5, 0.0, 0.0), Vec3(1.0, 1.0, 0.0), 0.5, friction = 0.4)
+    val b = sphere(Vec3(0.5, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0), 0.5, friction = 0.4)
+    val (left, right, _) = solve(a, b, contacts(a, b), 1.0)
+
+    near_vector(left.velocity + right.velocity, a.velocity + b.velocity)
+    near_vector(total_angular(left, right), total_angular(a, b))
+    assert(left.angular_velocity.z < -0.1 && right.angular_velocity.z < -0.1)
+    assert(left.kinetic_energy() + right.kinetic_energy() < a.kinetic_energy() + b.kinetic_energy())
+end rough_spheres
+
+@test("zero friction leaves smooth sphere spin unchanged")
+smooth_spheres()
+    val a = sphere(Vec3(-0.5, 0.0, 0.0), Vec3(1.0, 1.0, 0.0), 0.5)
+    val b = sphere(Vec3(0.5, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0), 0.5)
+    val (left, right, _) = solve(a, b, contacts(a, b), 1.0)
+
+    near_vector(left.angular_velocity, origin)
+    near_vector(right.angular_velocity, origin)
+
+@test("off-centre sphere box collision transfers energy to rotation without friction")
+off_centre()
+    val a = sphere(Vec3(-0.9, 0.3, 0.1), Vec3(2.0, 0.0, 0.0), 0.4)
+    val b = cuboid(origin, origin, Vec3(0.5, 0.6, 0.4), friction = 0.0)
+    val m = contacts(a, b)
+    val (left, right, _) = solve(a, b, m, 1.0)
+
+    assert_eq(m.count, 1)
+    assert(right.angular_velocity.y > 0.1 && right.angular_velocity.z < -0.1)
+    near_vector(left.velocity + right.velocity, a.velocity + b.velocity)
+    near_vector(total_angular(left, right), total_angular(a, b))
+    near_rotation(left.kinetic_energy() + right.kinetic_energy(), a.kinetic_energy() + b.kinetic_energy())
+end off_centre
+
+@test("centred face impact uses four points and introduces no artificial spin")
+face_impact()
+    val a = cuboid(Vec3(-0.5, 0.0, 0.0), Vec3(1.0, 0.0, 0.0), half, friction = 0.0)
+    val b = cuboid(Vec3(0.5, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0), half, friction = 0.0)
+    val m = contacts(a, b)
+    val (left, right, _) = solve(a, b, m, 1.0)
+
+    assert_eq(m.count, 4)
+    near_rotation(left.velocity.x, -1.0)
+    near_rotation(right.velocity.x, 1.0)
+    near_vector(left.angular_velocity, origin)
+    near_vector(right.angular_velocity, origin)
+end face_impact
+
+@test("box corners bounce from walls with torque even without friction")
+corner_wall()
+    var a = cuboid(origin, Vec3(2.0, 0.0, 0.0), half, friction = 0.0,
+                   orientation = Quaternion.from_euler(0.3, 0.4, 0.2))
+
+    a.position = Vec3(5.0 - a.extent(Vec3(1.0, 0.0, 0.0)), 0.0, 0.0)
+    val m = wall_contacts(a, Vec3(5.0, 5.0, 5.0), 0, 1.0)
+    val (b, _, _) = solve(a, a, m, 1.0, true)
+
+    assert(m.count >= 1)
+    assert(b.angular_velocity.length() > 0.1)
+    near_rotation(b.kinetic_energy(), a.kinetic_energy())
+end corner_wall
+
+@test("sphere corner detection uses closest point rather than a bounding sphere")
+sphere_corner()
+    val box = cuboid(origin, origin, half)
+    val separated = sphere(Vec3(0.8, 0.8, 0.0), origin, 0.4)
+    val touching = sphere(Vec3(0.75, 0.75, 0.0), origin, 0.4)
+
+    assert_eq(contacts(separated, box).count, 0)
+    assert_eq(contacts(touching, box).count, 1)
+    near_rotation(contacts(touching, box).depth, 0.4 - 0.125.sqrt())
+
+@test("sphere contained in a box gets a finite escape normal")
+sphere_inside()
+    val m = contacts(sphere(origin, origin, 0.2), cuboid(origin, origin, half))
+
+    assert_eq(m.count, 1)
+    near_rotation(m.normal.length(), 1.0)
+    near_rotation(m.depth, 0.7)
+
+@test("box collision geometry is invariant under a shared rotation")
+rotated_geometry()
+    val a = cuboid(origin, origin, half)
+    var b = cuboid(Vec3(0.85, 0.1, 0.0), origin, half)
+    val initial = contacts(a, b)
+    val q = Quaternion.from_euler(0.3, -0.4, 0.7)
+    var rotated = a
+
+    rotated.orientation = q
+    b.orientation = q
+    b.position = vec3(q.rotate(b.position.array()))
+    val result = contacts(rotated, b)
+
+    assert(result.count > 0)
+    near_rotation(result.depth, initial.depth)
+    near_vector(result.normal, vec3(q.rotate(initial.normal.array())))
+end rotated_geometry
+
+@test("free asymmetric cuboid preserves energy and world angular momentum")
+free_tumbling()
+    var b = cuboid(origin, origin, Vec3(0.2, 0.5, 0.8), angular_velocity = Vec3(1.2, 2.3, -0.7))
+    val momentum = b.angular_momentum()
+    val energy = b.kinetic_energy()
+
+    for _ in 0..<2000 do b = integrate(b, 0.002)
+    near_vector(b.angular_momentum(), momentum)
+    near_rotation(b.kinetic_energy(), energy)
+    near_rotation(b.orientation.norm_squared(), 1.0)
+end free_tumbling
+
+@test("invalid box dimensions and friction are rejected before motion")
+invalid_shapes()
+    var bodies = [cuboid(origin, Vec3(1.0, 0.0, 0.0), Vec3(-0.2, 0.4, 0.5))]
+    val room = Enclosure(Vec3(5.0, 5.0, 5.0), 1.0)
+
+    assert(step(bodies, room, 0.01).is_err())
+    assert_eq(bodies[0].position, origin)
+    bodies[0] = cuboid(origin, origin, half, friction = -0.1)
+    assert(step(bodies, room, 0.01).is_err())
+end invalid_shapes
+
+// Oracle depths were computed independently with rotation matrices and interval projections.
+@test("cross-edge SAT axes reject boxes whose six face projections all overlap")
+edge_separation()
+    val h = Vec3(0.7, 0.2, 0.15)
+    val a = cuboid(origin, origin, h, orientation = Quaternion.from_euler(
+        0.5455110924283173, -0.13857614443942579, -0.48468192281258515))
+    val b = cuboid(Vec3(0.2580079392165131, 0.1732192619164068, -0.7390977692048177), origin, h,
+                    orientation = Quaternion.from_euler(-0.9618565670172017, 0.46275149500473045, -0.3887893940651266))
+
+    assert_eq(contacts(a, b).count, 0)
+end edge_separation
+
+@test("edge-edge contact matches an independent SAT depth and has a finite contact point")
+edge_contact()
+    val h = Vec3(0.7, 0.2, 0.15)
+    val a = cuboid(origin, origin, h, orientation = Quaternion.from_euler(
+        -0.5948959423021738, 0.08488518678556334, -0.22287637194850096))
+    val b = cuboid(Vec3(-0.9615398065013181, 0.5471877233358597, 0.6135915372275687), origin, h,
+                    orientation = Quaternion.from_euler(0.46694114914091833, 0.606119067944459, -0.17112481569047877))
+    val m = contacts(a, b)
+    val reverse = contacts(b, a)
+
+    assert_eq(m.count, 1)
+    near_rotation(m.depth, 0.01338042692830399)
+    near_vector(m.normal, reverse.normal * -1.0)
+    near_vector(m.points[0], reverse.points[0])
+    near_rotation(m.normal.length(), 1.0)
+    assert(m.points[0].finite())
+end edge_contact
+
+@test("inertia uses cuboid side lengths and rotates correctly into world space")
+inertia_tensor()
+    val b = cuboid(origin, origin, Vec3(1.0, 2.0, 3.0), mass = 6.0,
+                   orientation = Quaternion.from_axis_angle([0.0, 0.0, 1.0], 1.5707963267948966))
+
+    near_vector(b.inertia().diagonal(), Vec3(26.0, 20.0, 10.0))
+    near_vector(b.inverse_inertia(Vec3(20.0, 26.0, 10.0)), Vec3(1.0, 1.0, 1.0))
+
+@test("a rotated face impact has the same response in another world frame")
+rotated_response()
+    val q = Quaternion.from_euler(0.3, -0.5, 0.7)
+    var a = cuboid(Vec3(-0.5, 0.0, 0.0), Vec3(1.0, 0.0, 0.0), half, friction = 0.0)
+    var b = cuboid(Vec3(0.5, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0), half, friction = 0.0)
+
+    a.position = vec3(q.rotate(a.position.array()))
+    b.position = vec3(q.rotate(b.position.array()))
+    a.velocity = vec3(q.rotate(a.velocity.array()))
+    b.velocity = vec3(q.rotate(b.velocity.array()))
+    a.orientation = q
+    b.orientation = q
+    val (left, right, _) = solve(a, b, contacts(a, b), 1.0)
+
+    near_vector(left.velocity, a.velocity * -1.0)
+    near_vector(right.velocity, b.velocity * -1.0)
+    near_vector(left.angular_velocity, origin)
+    near_vector(right.angular_velocity, origin)
+end rotated_response
+
+@test("two-dimensional wall friction follows the tangential velocity and stays in the cone")
+two_tangents()
+    val a = sphere(origin, Vec3(2.0, -1.0, 3.0), 0.5, friction = 0.2)
+    var points: [8]Vec3
+
+    points[0] = Vec3(0.0, -0.5, 0.0)
+    val (b, _, _) = solve(a, a, Manifold(Vec3(0.0, -1.0, 0.0), 0.0, points, 1), 1.0, true)
+    val impulse = b.velocity - a.velocity
+
+    near_rotation((impulse.x * impulse.x + impulse.z * impulse.z).sqrt(), 0.4)
+    near_rotation(impulse.x / impulse.z, 2.0 / 3.0)
+    assert(b.angular_velocity.x > 0 && b.angular_velocity.z < 0)
+    assert(b.kinetic_energy() < a.kinetic_energy())
+end two_tangents
+
+@test("anisotropic inertia and clamped friction never add energy at an isolated corner")
+anisotropic_friction()
+    for i in 1..<12
+        var a = cuboid(origin, Vec3(real(i), -1.0, 2.0), Vec3(0.1, 0.3, 0.8), friction = 0.15,
+                       orientation = Quaternion.from_euler(real(i) * 0.13, 0.4, 0.7))
+
+        a.position = Vec3(0.0, -5.0 + a.extent(Vec3(0.0, 1.0, 0.0)), 0.0)
+        val m = wall_contacts(a, Vec3(5.0, 5.0, 5.0), 1, -1.0)
+        val (b, _, _) = solve(a, a, m, 1.0, true)
+
+        assert(m.count > 0)
+        assert(b.kinetic_energy() <= a.kinetic_energy() + 1e-9)
+    end for
+end anisotropic_friction

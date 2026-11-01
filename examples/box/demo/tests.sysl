@@ -1,0 +1,160 @@
+module demo
+@tests
+
+import sh.sysl.rheos.*
+
+@test("one minute in the box conserves energy, contains bodies and keeps unit orientations")
+long_run()
+    val bodies = scene(false, false)
+    val initial = energy(bodies.view())
+    var impulses = 0
+
+    for tick in 0..<7200
+        impulses += step(bodies.view(), enclosure, 1.0 / 120.0).unwrap().impulses
+
+        if tick % 120 == 0
+            for b in bodies.view()
+                assert(b.position.finite() && b.velocity.finite())
+                assert(b.position.x.abs() + b.radius <= enclosure.half_size.x + 1e-8)
+                assert(b.position.y.abs() + b.radius <= enclosure.half_size.y + 1e-8)
+                assert(b.position.z.abs() + b.radius <= enclosure.half_size.z + 1e-8)
+                assert((b.orientation.norm_squared() - 1.0).abs() < 1e-12)
+            end for
+
+            for i in 0..<bodies.len()
+                for j in i + 1..<bodies.len()
+                    val a = bodies[i]
+                    val b = bodies[j]
+
+                    assert((a.position - b.position).length() >= a.radius + b.radius - 1e-4)
+    end for
+
+    assert(impulses > 1000, "the run actually exercises collisions")
+    assert((energy(bodies.view()) - initial).abs() / initial < 1e-10)
+end long_run
+
+@test("reset recreates the same simulation without sharing its bodies")
+replay()
+    val a = scene()
+    val b = scene()
+    val original = b[0].position
+
+    _ = step(a.view(), enclosure, 1.0 / 120.0).unwrap()
+    assert_eq(b[0].position, original)
+    _ = step(b.view(), enclosure, 1.0 / 120.0).unwrap()
+
+    for i in 0..<a.len()
+        assert_eq(a[i].position, b[i].position)
+        assert_eq(a[i].velocity, b[i].velocity)
+        assert_eq(a[i].orientation, b[i].orientation)
+end replay
+
+@test("mixed shapes stay contained and separated while friction dissipates energy")
+mixed_run()
+    val bodies = scene()
+    val initial = energy(bodies.view())
+    var peak = initial
+    var rotating = false
+
+    for tick in 0..<2400
+        _ = step(bodies.view(), enclosure, 1.0 / 120.0).unwrap()
+        val now = energy(bodies.view())
+
+        if now > peak then peak = now
+        if tick % 120 == 0
+            for b in bodies.view()
+                assert(b.position.finite() && b.angular_velocity.finite())
+                for axis in 0..<3
+                    for sign in [-1.0, 1.0]
+                        val n = axis_vector(axis)*sign
+
+                        assert(b.position.dot(n)+b.extent(n) <= enclosure.half_size.array()[axis]+1e-7)
+                assert((b.orientation.norm_squared() - 1.0).abs() < 1e-10)
+            end for
+
+            for i in 0..<bodies.len()
+                for j in i + 1..<bodies.len()
+                    val m = contacts(bodies[i], bodies[j])
+
+                    assert(m.count == 0 || m.depth < 1e-3)
+            end for
+
+            for i in 0..<bodies.len()
+                if i % 2 == 0 && bodies[i].angular_velocity.length() > 0.1 then rotating = true
+    end for
+
+    assert(rotating, "initially unspinning bodies acquire spin from impacts")
+    assert(peak <= initial * 1.001, s"energy grew from ${initial} to ${peak}")
+    assert(energy(bodies.view()) < initial * 0.95, "friction dissipates energy")
+end mixed_run
+
+@test("frictionless mixed shapes do not gain energy during sustained tumbling")
+mixed_elastic_run()
+    val bodies = scene(true, false)
+    val initial = energy(bodies.view())
+
+    for tick in 0..<3600
+        _ = step(bodies.view(), enclosure, 1.0 / 120.0).unwrap()
+
+        if tick % 120 == 0
+            assert(energy(bodies.view()) <= initial * 1.001, "elastic contacts must not create energy")
+    end for
+end mixed_elastic_run
+
+@test("fresh scene seeds change initial conditions and replay reproduces them")
+random_scenes()
+    var sequence = seed_sequence(42)
+    val a = scene(seed = sequence.last_seed)
+    val next = sequence.next_seed()
+    val b = scene(seed = next)
+    val replayed = scene(seed = next)
+
+    assert(next != 42)
+    assert(sequence.next_seed() != next, "repeated resets advance the seed stream")
+    assert(a[0].position != b[0].position)
+    assert(a[0].velocity != b[0].velocity)
+    assert(a[1].orientation != b[1].orientation)
+    for k in 0..<b.len()
+        assert_eq(b[k].position, replayed[k].position)
+        assert_eq(b[k].velocity, replayed[k].velocity)
+        assert_eq(b[k].orientation, replayed[k].orientation)
+        assert_eq(b[k].half_size, replayed[k].half_size)
+    end for
+end random_scenes
+
+@test("seeded initial scenes fit the box with no overlapping bounding spheres")
+random_packing()
+    val seeds: []u64 = [0,1,42,1337,18446744073709551615]
+
+    for seed in seeds
+        val bodies = scene(seed = seed)
+
+        for b in bodies.view()
+            assert(b.position.x.abs()+b.radius < enclosure.half_size.x)
+            assert(b.position.y.abs()+b.radius < enclosure.half_size.y)
+            assert(b.position.z.abs()+b.radius < enclosure.half_size.z)
+            assert((b.orientation.norm_squared()-1.0).abs() < 1e-12)
+        for i in 0..<bodies.len()
+            for j in i+1..<bodies.len()
+                assert((bodies[i].position-bodies[j].position).length() > bodies[i].radius+bodies[j].radius)
+    end for
+end random_packing
+
+@test("several random mixed scenes survive collisions with finite state and bounded energy")
+random_motion()
+    val seeds: []u64 = [0,1,7,19,1337,18446744073709551615]
+
+    for seed in seeds
+        val bodies = scene(seed=seed)
+        val initial = energy(bodies.view())
+
+        for tick in 0..<360
+            step(bodies.view(),enclosure,1.0/120.0) match
+                Ok(_) -> ()
+                Err(message) -> assert(false,s"seed ${seed}, tick ${tick}: ${message}")
+            assert(energy(bodies.view()) <= initial*1.001)
+            for b in bodies.view()
+                assert(b.position.finite() && b.angular_velocity.finite())
+        end for
+    end for
+end random_motion

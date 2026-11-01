@@ -1,0 +1,119 @@
+module sh.sysl.rheos
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{min, max}
+
+// Immutable geometry shared by bodies. Vertices are recentered on the uniform-density centre of mass.
+struct Hull
+    private points: Buf[Vec3]
+    private triangles: Buf[[3]int]
+    centre: Vec3
+    volume: real
+    unit_inertia: Inertia
+    radius: real
+    inside_radius: real
+    half_size: Vec3
+
+    vertices(self) -> []const Vec3 = self.points.view()
+    faces(self) -> []const [3]int = self.triangles.view()
+    support(self, direction: Vec3) -> Vec3
+        var best = self.points[0]
+
+        for p in self.points.view()
+            if p.dot(direction) > best.dot(direction) then best = p
+        best
+end Hull
+
+// A closed, convex, outward-wound triangular mesh. This validates a hull, not a point-cloud hull builder.
+// Mass properties are volume integrals over tetrahedra, including all products of inertia.
+hull(vertices: []const Vec3, faces: []const [3]int) -> Result[&Hull, string]
+    if vertices.len < 4 || faces.len < 4 then return Err("a solid hull needs at least four vertices and faces")
+    val reference = vertices[0]
+    var scale = 0.0
+
+    for p in vertices
+        if !p.finite() then return Err("hull vertices must be finite")
+        scale = max(scale, (p - reference).length())
+    if !scale.is_finite() || scale == 0 then return Err("hull has no extent")
+
+    for f in faces
+        for index in f
+            if index < 0 || usize(index) >= vertices.len then return Err("hull face index is out of range")
+        val a = vertices[f[0]]
+        val n = (vertices[f[1]] - a).cross(vertices[f[2]] - a)
+
+        if n.length() < scale*scale*1e-12 then return Err("hull has a degenerate face")
+        for p in vertices
+            if (p-a).dot(n.unit()) > scale*1e-8 then return Err("hull is nonconvex or has inward faces")
+        for edge in 0..<3
+            val from = f[edge]
+            val to = f[(edge+1)%3]
+            var reverse = 0
+            var forward = 0
+
+            for other in faces
+                for k in 0..<3
+                    if other[k] == to && other[(k+1)%3] == from then reverse += 1
+                    if other[k] == from && other[(k+1)%3] == to then forward += 1
+            if reverse != 1 || forward != 1 then return Err("hull edges must form a closed two-manifold")
+    end for
+
+    var volume = 0.0
+    var first = Vec3(0.0, 0.0, 0.0)
+    var second: [3][3]real
+
+    for f in faces
+        val a = vertices[f[0]] - reference
+        val b = vertices[f[1]] - reference
+        val c = vertices[f[2]] - reference
+        val v = a.dot(b.cross(c)) / 6.0
+        val sum = a + b + c
+        val aa = a.array()
+        val bb = b.array()
+        val cc = c.array()
+        val ss = sum.array()
+
+        volume += v
+        first = first + sum * (v * 0.25)
+        for row in 0..<3
+            for col in 0..<3
+                second[row][col] += v / 20.0 * (ss[row]*ss[col] + aa[row]*aa[col] + bb[row]*bb[col] + cc[row]*cc[col])
+    end for
+
+    if volume <= scale*scale*scale*1e-12 then return Err("hull has no positive enclosed volume")
+    val relative_centre = first * (1.0 / volume)
+    val centre = reference + relative_centre
+    val c = relative_centre.array()
+
+    for row in 0..<3
+        for col in 0..<3 do second[row][col] = second[row][col] / volume - c[row]*c[col]
+    val inertia = Inertia(second[1][1]+second[2][2], second[0][0]+second[2][2], second[0][0]+second[1][1],
+                            -second[0][1], -second[0][2], -second[1][2])
+
+    if !inertia.finite() || !inertia.positive() then return Err("hull inertia is not positive definite")
+    val points: Buf[Vec3] = buf()
+    val triangles: Buf[[3]int] = buf()
+    var radius = 0.0
+    var inside = scale
+    var size = [0.0, 0.0, 0.0]
+
+    for p in vertices
+        val local = p - centre
+        val xyz = local.array()
+
+        points.push(local)
+        radius = max(radius, local.length())
+        for k in 0..<3 do size[k] = max(size[k], xyz[k].abs())
+    end for
+
+    for f in faces
+        triangles.push(f)
+        val a = points[f[0]]
+        val normal = (points[f[1]]-a).cross(points[f[2]]-a).unit()
+
+        inside = min(inside, a.dot(normal))
+    end for
+
+    if inside <= scale*1e-10 then return Err("hull has no interior around its centre of mass")
+    Ok(Hull(points, triangles, centre, volume, inertia, radius, inside, vec3(size)))
+end hull

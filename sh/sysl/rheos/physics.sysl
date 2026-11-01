@@ -1,0 +1,107 @@
+module sh.sysl.rheos
+
+import sysl.math.{min, max}
+
+// Enclosure centred at the origin in metres. Wall friction uses the body's coefficient.
+struct Enclosure
+    half_size: Vec3
+    restitution: real
+
+struct StepStats
+    substeps: int
+    impulses: int
+
+// Allocation-free, with input validation before mutation. Discrete, adaptive collision steps.
+step(bodies: []Body, box: Enclosure, dt: real) -> Result[StepStats, string]
+    val h = box.half_size
+    val room_radius = min(h.x, min(h.y, h.z))
+
+    if !h.finite() || room_radius <= 0
+        return Err("box half sizes must be finite and positive")
+    if !box.restitution.is_finite() || box.restitution < 0 || box.restitution > 1
+        return Err("restitution must be between zero and one")
+    if !dt.is_finite() || dt < 0 || dt > 0.1
+        return Err("step must be finite and between zero and 0.1 seconds")
+
+    var smallest = room_radius
+    var least_mass = 1.0e300
+    var least_inertia = 1.0e300
+    var largest_radius = 0.0
+    var anisotropy = 1.0
+    var total_energy = 0.0
+
+    for b in bodies
+        val q = b.orientation
+        val inertia = b.inertia()
+        val minimum_inertia = inertia.smallest_bound()
+        val maximum_inertia = inertia.norm_bound()
+
+        if !b.position.finite() || !b.velocity.finite() || !b.angular_velocity.finite() ||
+           !b.angular_velocity.length().is_finite() || !(1.0 / b.mass).is_finite() ||
+           !b.radius.is_finite() || b.radius <= 0 || b.radius >= room_radius ||
+           !b.mass.is_finite() || b.mass <= 0 || !b.half_size.finite() || b.smallest_extent() <= 0 ||
+           !inertia.finite() || !inertia.positive() || minimum_inertia <= 0 || !(1.0 / minimum_inertia).is_finite() ||
+           !b.friction.is_finite() || b.friction < 0 || b.friction > 1 ||
+           b.shape == Shape.Box && (b.radius - b.half_size.length()).abs() > b.radius * 1e-10 ||
+           !q.norm_squared().is_finite() || (q.norm_squared() - 1.0).abs() > 1e-6
+            return Err("bodies need finite state, positive dimensions and mass, fitting bounds, unit orientation and friction in [0,1]")
+
+        smallest = min(smallest, b.smallest_extent())
+        least_mass = min(least_mass, b.mass)
+        least_inertia = min(least_inertia, minimum_inertia)
+        largest_radius = max(largest_radius, b.radius)
+        anisotropy = max(anisotropy, maximum_inertia / minimum_inertia)
+        total_energy += b.kinetic_energy()
+    end for
+
+    val speed_bound = (2.0 * total_energy / least_mass).sqrt()
+    val spin_bound = (2.0 * total_energy / least_inertia).sqrt()
+    val travel = (speed_bound + spin_bound * largest_radius) * dt / (smallest * 0.2)
+    val rotation = spin_bound * dt * anisotropy / 0.05
+    val divisions = max(travel, rotation)
+
+    if !divisions.is_finite() || divisions > 4095
+        return Err("step needs too many substeps; reduce the time step or speed")
+    if dt == 0 || bodies.len == 0 then return Ok(StepStats(0, 0))
+
+    val count = int(divisions) + 1
+    val tick = dt / real(count)
+    var impulses = 0
+
+    for _ in 0..<count
+        for i in 0..<bodies.len do bodies[i] = integrate(bodies[i], tick)
+
+        // Contact chains get several sweeps. Each manifold internally accumulates its impulses.
+        for _ in 0..<4
+            for i in 0..<bodies.len
+                for j in i + 1..<bodies.len
+                    val m = contacts_checked(bodies[i], bodies[j]) match
+                        Ok(value) -> value
+                        Err(message) -> return Err(s"contact between bodies ${i+1} and ${j+1}: ${message}")
+
+                    if m.count > 0
+                        val (a, b, hits) = resolve(bodies[i], bodies[j], m, box.restitution)
+
+                        bodies[i] = a
+                        bodies[j] = b
+                        impulses += hits
+            end for
+
+            for i in 0..<bodies.len
+                for axis in 0..<3
+                    for sign in [-1.0, 1.0]
+                        val m = wall_contacts(bodies[i], h, axis, sign)
+
+                        if m.count > 0
+                            val (solved, _, hits) = solve(bodies[i], bodies[i], m, box.restitution, true)
+                            var b = solved
+
+                            b.position = b.position - m.normal * m.depth
+                            bodies[i] = b
+                            impulses += hits
+            end for
+        end for
+    end for
+
+    Ok(StepStats(count, impulses))
+end step

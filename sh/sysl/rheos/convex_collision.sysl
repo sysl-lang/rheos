@@ -1,0 +1,263 @@
+module sh.sysl.rheos
+
+import sysl.math.{min, max}
+
+// Detection and penetration refinement use the same scale-relative contact accuracy.
+private const support_tolerance: real = 1e-5
+
+private struct Support
+    p: Vec3
+    a: Vec3
+    b: Vec3
+
+private struct Simplex
+    points: [4]Support
+    count: int
+
+private struct Face
+    i: int
+    j: int
+    k: int
+    normal: Vec3
+    distance: real
+
+private support_pair(a: Body, b: Body, n: Vec3) -> Support
+    val pa = a.support(n)
+    val pb = b.support(n * -1.0)
+
+    Support(pa-pb, pa, pb)
+
+private perpendicular(v: Vec3) -> Vec3 =
+    v.cross(if v.x.abs() < v.y.abs() then Vec3(1.0, 0.0, 0.0) else Vec3(0.0, 1.0, 0.0)).unit()
+
+// Enumerate the simplex's faces and solve their affine closest-point coordinates. Keeping the
+// closest admissible subset avoids the region-classification cycling of boolean-only GJK.
+private closest_simplex(s: Simplex) -> (Simplex, Vec3)
+    var best = 1.0e300
+    var answer = s
+    var closest = Vec3(0.0,0.0,0.0)
+
+    for mask in 1..<(1 << s.count)
+        var ids: [4]int
+        var count = 0
+
+        for k in 0..<s.count
+            if mask & (1 << k) != 0
+                ids[count] = k
+                count += 1
+        var weights: [4]real
+
+        weights[0] = 1.0
+        val origin = s.points[ids[0]].p
+        if count == 2
+            val u = s.points[ids[1]].p-origin
+            val length = u.dot(u)
+
+            if length < 1e-24 then continue
+            weights[1] = -origin.dot(u)/length
+            weights[0] = 1.0-weights[1]
+        elif count == 3
+            val u = s.points[ids[1]].p-origin
+            val v = s.points[ids[2]].p-origin
+            val uu = u.dot(u)
+            val uv = u.dot(v)
+            val vv = v.dot(v)
+            val determinant = uu*vv-uv*uv
+
+            if determinant <= 1e-14*uu*vv then continue
+            weights[1] = (-origin.dot(u)*vv+origin.dot(v)*uv)/determinant
+            weights[2] = (-origin.dot(v)*uu+origin.dot(u)*uv)/determinant
+            weights[0] = 1.0-weights[1]-weights[2]
+        elif count == 4
+            val u = s.points[ids[1]].p-origin
+            val v = s.points[ids[2]].p-origin
+            val w = s.points[ids[3]].p-origin
+            val determinant = u.dot(v.cross(w))
+
+            if determinant.abs() <= 1e-12*u.length()*v.length()*w.length() then continue
+            weights[1] = (origin * -1.0).dot(v.cross(w))/determinant
+            weights[2] = u.dot((origin * -1.0).cross(w))/determinant
+            weights[3] = u.dot(v.cross(origin * -1.0))/determinant
+            weights[0] = 1.0-weights[1]-weights[2]-weights[3]
+        end if
+
+        var valid = true
+        var point = Vec3(0.0,0.0,0.0)
+
+        for k in 0..<count
+            if weights[k] < -1e-10 || weights[k] > 1.0+1e-10 then valid = false
+            point = point+s.points[ids[k]].p*weights[k]
+        if !valid then continue
+
+        // A full-rank tetrahedron's affine projection is exactly the origin. Once its
+        // barycentric coordinates contain the origin, rebuilding that zero with floating-point
+        // weighted sums can make it look farther away than a nearly coplanar triangle.
+        if count == 4 then return (s,Vec3(0.0,0.0,0.0))
+        if count == 3
+            val u = s.points[ids[1]].p-origin
+            val v = s.points[ids[2]].p-origin
+            val normal = u.cross(v).unit()
+
+            point = normal*normal.dot(origin)
+        val distance = point.dot(point)
+
+        if distance < best-1e-24 || (distance-best).abs() <= 1e-24 && count > answer.count
+            best = distance
+            closest = point
+            answer.count = count
+            for k in 0..<count do answer.points[k] = s.points[ids[k]]
+    end for
+
+    (answer,closest)
+end closest_simplex
+
+private gjk(a: Body, b: Body) -> Result[Simplex, string]
+    var s: Simplex
+    var direction = (b.position-a.position).unit()
+    val tolerance = (a.radius+b.radius)*support_tolerance
+
+    s.points[0] = support_pair(a,b,direction)
+    s.count = 1
+    direction = (s.points[0].p * -1.0).unit()
+    for _ in 0..<64
+        val next = support_pair(a,b,direction)
+
+        if next.p.dot(direction) <= tolerance
+            s.count = 0
+            return Ok(s)
+        s.points[s.count] = next
+        s.count += 1
+        val (reduced,closest) = closest_simplex(s)
+
+        s = reduced
+        if s.count == 4 then return Ok(s)
+        if closest.length() > 1e-12
+            direction = (closest * -1.0).unit()
+        elif s.count == 3
+            direction = (s.points[1].p-s.points[0].p).cross(s.points[2].p-s.points[0].p).unit()
+        elif s.count == 2
+            direction = perpendicular(s.points[1].p-s.points[0].p)
+        else
+            direction = Vec3(0.0,1.0,0.0)
+    end for
+
+    Err("GJK did not converge in 64 iterations")
+end gjk
+
+private face(vertices: []Support, i: int, j: int, k: int, inside: Vec3) -> Face
+    val p = vertices[i].p
+    var n = (vertices[j].p-p).cross(vertices[k].p-p).unit()
+    var second = j
+    var third = k
+
+    if n.dot(inside-p) > 0
+        n = n * -1.0
+        second = k
+        third = j
+    Face(i, second, third, n, max(0.0, n.dot(p)))
+end face
+
+private witness(vertices: []Support, f: Face) -> Manifold
+    val a = vertices[f.i]
+    val b = vertices[f.j]
+    val c = vertices[f.k]
+    val u = b.p-a.p
+    val v = c.p-a.p
+    val w = f.normal*f.distance-a.p
+    val uu = u.dot(u)
+    val uv = u.dot(v)
+    val vv = v.dot(v)
+    val denominator = uu*vv-uv*uv
+    var wb = 0.0
+    var wc = 0.0
+
+    if denominator > 1e-24
+        wb = max(0.0, min(1.0, (vv*w.dot(u)-uv*w.dot(v))/denominator))
+        wc = max(0.0, min(1.0, (uu*w.dot(v)-uv*w.dot(u))/denominator))
+    val wa = max(0.0, 1.0-wb-wc)
+    val total = wa+wb+wc
+    val pa = (a.a*wa+b.a*wb+c.a*wc) * (1.0/total)
+    val pb = (a.b*wa+b.b*wb+c.b*wc) * (1.0/total)
+    var points: [8]Vec3
+
+    points[0] = (pa+pb)*0.5
+    Manifold(f.normal, f.distance, points, 1)
+end witness
+
+// Exact support mappings, finite-accuracy EPA penetration and witness reconstruction.
+// Exhaustion is an explicit error rather than a fabricated contact or a silently missed collision.
+private[rheos] convex_contacts(a: Body, b: Body) -> Result[Manifold, string]
+    val simplex = gjk(a, b)?
+
+    if simplex.count == 0
+        var points: [8]Vec3
+
+        return Ok(Manifold(Vec3(1.0, 0.0, 0.0), 0.0, points, 0))
+    var vertices: [132]Support
+    var faces: [264]Face
+    var vertex_count = 4
+    var face_count = 4
+    var inside = Vec3(0.0, 0.0, 0.0)
+
+    for k in 0..<4
+        vertices[k] = simplex.points[k]
+        inside = inside + vertices[k].p*0.25
+    for k in 0..<4
+        val indices = [[0,1,2], [0,3,1], [0,2,3], [1,3,2]][k]
+
+        faces[k] = face(vertices, indices[0], indices[1], indices[2], inside)
+    val tolerance = (a.radius+b.radius)*support_tolerance
+
+    for _ in 0..<128
+        var closest = 0
+
+        for k in 1..<face_count
+            if faces[k].distance < faces[closest].distance then closest = k
+        val nearest = faces[closest]
+        val next = support_pair(a, b, nearest.normal)
+
+        if next.p.dot(nearest.normal)-nearest.distance <= tolerance
+            if nearest.distance <= tolerance
+                var points: [8]Vec3
+
+                return Ok(Manifold(nearest.normal,0.0,points,0))
+            return Ok(witness(vertices, nearest))
+        var edges: [528][2]int
+        var edge_count = 0
+        var k = 0
+
+        while k < face_count
+            val f = faces[k]
+
+            if f.normal.dot(next.p-vertices[f.i].p) > 1e-10
+                for edge in [[f.i,f.j], [f.j,f.k], [f.k,f.i]]
+                    var reverse = -1
+
+                    for e in 0..<edge_count
+                        if edges[e][0] == edge[1] && edges[e][1] == edge[0] then reverse = e
+                    if reverse >= 0
+                        edge_count -= 1
+                        edges[reverse] = edges[edge_count]
+                    else
+                        if edge_count >= 528 then return Err("EPA horizon capacity exceeded")
+                        edges[edge_count] = edge
+                        edge_count += 1
+                end for
+
+                face_count -= 1
+                faces[k] = faces[face_count]
+            else
+                k += 1
+        end while
+
+        if edge_count == 0 then return Err("EPA found no expansion horizon")
+        vertices[vertex_count] = next
+        for e in 0..<edge_count
+            if face_count >= 264 then return Err("EPA face capacity exceeded")
+            faces[face_count] = face(vertices, edges[e][0], edges[e][1], vertex_count, inside)
+            face_count += 1
+        vertex_count += 1
+    end for
+
+    Err("EPA did not converge in 128 iterations")
+end convex_contacts

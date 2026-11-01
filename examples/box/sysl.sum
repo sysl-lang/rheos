@@ -1,0 +1,6 @@
+github.com/sysl-lang/plutovg v0.2.6 sha256:daef22f6d3f1cf301052abc013ffa5634f2b9b3601dd5001a82ef25be4a584e2
+github.com/sysl-lang/png v0.2.3 sha256:dfca3904935431bf4a72eb3335971b4944ee02489d443b064b507f610f0e6ebe
+github.com/sysl-lang/quaternion v0.1.0 sha256:e4d82c4df2c20683d64e344a57063d543ef71d6426a1f7dcf339562c2008f4c3
+github.com/sysl-lang/sdl3 v0.3.23 sha256:ea040500834501b163a82f026fcd50363f4e3387408a4b2d7c44cf5e8f6f2319
+github.com/sysl-lang/syslui v0.1.16 sha256:3544059e653e4c10365aa71614d37ec28bde0e48ce4d3fcd966d8ea32eab8d80
+github.com/sysl-lang/syslui-sdl v0.2.21 sha256:27527ea53a666709f53b750c46f60606874912d8d153b2137e182d0b99ccf9e9

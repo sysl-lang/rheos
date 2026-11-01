@@ -1,0 +1,146 @@
+module sh.sysl.rheos
+
+import sh.sysl.quaternion.Quaternion
+import sysl.math.{min, max}
+
+enum Shape
+    Sphere
+    Box
+    Ellipsoid
+    Convex
+
+// Angular velocity remains in body coordinates. Contact velocities and impulses use world space.
+struct Body
+    position: Vec3
+    velocity: Vec3
+    radius: real
+    mass: real
+    orientation: Quaternion[real]
+    angular_velocity: Vec3
+    shape: Shape
+    half_size: Vec3
+    friction: real
+    mesh: Option[&Hull]
+
+    rotate(self, v: Vec3) -> Vec3 = vec3(self.orientation.rotate(v.array()))
+    unrotate(self, v: Vec3) -> Vec3 = vec3(self.orientation.conjugate().rotate(v.array()))
+    world_omega(self) -> Vec3 = self.rotate(self.angular_velocity)
+    point_velocity(self, arm: Vec3) -> Vec3 = self.velocity + self.world_omega().cross(arm)
+
+    inertia(self) -> Inertia
+        if self.shape == Shape.Convex
+            return self.mesh match
+                Some(mesh) -> mesh.unit_inertia.scaled(self.mass)
+                None -> diagonal_inertia(Vec3(0.0, 0.0, 0.0))
+        if self.shape == Shape.Sphere
+            val i = 0.4 * self.mass * self.radius * self.radius
+
+            return diagonal_inertia(Vec3(i, i, i))
+        val h = self.half_size
+        val m = self.mass * (if self.shape == Shape.Ellipsoid then 0.2 else 1.0 / 3.0)
+
+        diagonal_inertia(Vec3(m * (h.y*h.y + h.z*h.z), m * (h.x*h.x + h.z*h.z), m * (h.x*h.x + h.y*h.y)))
+    end inertia
+
+    inverse_inertia(self, v: Vec3) -> Vec3 = self.rotate(self.inertia().inverse().times(self.unrotate(v)))
+
+    angular_momentum(self) -> Vec3 = self.rotate(self.inertia().times(self.angular_velocity))
+
+    kinetic_energy(self) -> real =
+        0.5 * self.mass * self.velocity.dot(self.velocity) +
+        0.5 * self.angular_velocity.dot(self.inertia().times(self.angular_velocity))
+
+    // Projection of this oriented shape onto a world-space direction.
+    extent(self, n: Vec3) -> real
+        if self.shape == Shape.Sphere then return self.radius
+        if self.shape == Shape.Convex then return (self.support(n) - self.position).dot(n)
+        val d = self.unrotate(n)
+
+        if self.shape == Shape.Ellipsoid then return self.half_size.times(d).length()
+        val h = self.half_size
+
+        d.x.abs() * h.x + d.y.abs() * h.y + d.z.abs() * h.z
+    end extent
+
+    smallest_extent(self) -> real
+        if self.shape == Shape.Convex
+            return self.mesh match
+                Some(mesh) -> mesh.inside_radius
+                None -> 0.0
+        if self.shape == Shape.Sphere then self.radius else min(self.half_size.x, min(self.half_size.y, self.half_size.z))
+
+    support(self, n: Vec3) -> Vec3
+        if self.shape == Shape.Sphere then return self.position + n.unit() * self.radius
+        val direction = self.unrotate(n)
+
+        if self.shape == Shape.Ellipsoid
+            val weighted = self.half_size.times(direction)
+
+            return self.position + self.rotate(self.half_size.times(weighted) * (1.0 / weighted.length()))
+        if self.shape == Shape.Convex
+            return self.mesh match
+                Some(mesh) -> self.position + self.rotate(mesh.support(direction))
+                None -> self.position
+
+        val d = direction.array()
+        val h = self.half_size.array()
+        var p = [0.0, 0.0, 0.0]
+
+        for k in 0..<3
+            p[k] = if d[k] > 1e-10 then h[k] elif d[k] < -1e-10 then -h[k] else 0.0
+        self.position + self.rotate(vec3(p))
+    end support
+end Body
+
+sphere(position: Vec3, velocity: Vec3, radius: real = 0.4, mass: real = 1.0,
+       angular_velocity: Vec3 = Vec3(0.0, 0.0, 0.0), friction: real = 0.0) -> Body =
+    Body(position, velocity, radius, mass, Quaternion.identity(), angular_velocity,
+         Shape.Sphere, Vec3(radius, radius, radius), friction, None)
+
+// half_size is measured along the cuboid's own axes; radius is its bounding sphere only.
+cuboid(position: Vec3, velocity: Vec3, half_size: Vec3, mass: real = 1.0,
+       angular_velocity: Vec3 = Vec3(0.0, 0.0, 0.0), friction: real = 0.3,
+       orientation: Quaternion[real] = Quaternion.identity()) -> Body =
+    Body(position, velocity, half_size.length(), mass, orientation, angular_velocity,
+         Shape.Box, half_size, friction, None)
+
+ellipsoid(position: Vec3, velocity: Vec3, semi_axes: Vec3, mass: real = 1.0,
+          angular_velocity: Vec3 = Vec3(0.0, 0.0, 0.0), friction: real = 0.3,
+          orientation: Quaternion[real] = Quaternion.identity()) -> Body =
+    Body(position, velocity, max(semi_axes.x, max(semi_axes.y, semi_axes.z)), mass, orientation,
+         angular_velocity, Shape.Ellipsoid, semi_axes, friction, None)
+
+convex(position: Vec3, velocity: Vec3, hull: &Hull, mass: real = 1.0,
+       angular_velocity: Vec3 = Vec3(0.0, 0.0, 0.0), friction: real = 0.3,
+       orientation: Quaternion[real] = Quaternion.identity()) -> Body =
+    Body(position, velocity, hull.radius, mass, orientation, angular_velocity, Shape.Convex,
+         hull.half_size, friction, Some(hull))
+
+// Implicit midpoint Euler equations plus a Cayley orientation update preserve the free body's
+// energy and world angular momentum (to the iteration tolerance), including asymmetric cuboids.
+private[rheos] integrate(b: Body, dt: real) -> Body
+    var out = b
+
+    out.position = b.position + b.velocity * dt
+    if b.shape == Shape.Sphere
+        out.orientation = b.orientation.integrate(b.angular_velocity.array(), dt)
+        return out
+
+    val inertia = b.inertia()
+    val initial = b.angular_velocity
+    var omega = initial
+
+    for _ in 0..<12
+        val middle = (initial + omega) * 0.5
+        val torque = middle.cross(inertia.times(middle)) * -1.0
+
+        omega = initial + inertia.inverse().times(torque) * dt
+    end for
+
+    val middle = (initial + omega) * (dt * 0.25)
+    val delta = Quaternion(1.0, middle.x, middle.y, middle.z).normalize()
+
+    out.orientation = (b.orientation * delta).normalize()
+    out.angular_velocity = omega
+    out
+end integrate

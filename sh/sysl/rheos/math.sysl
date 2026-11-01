@@ -1,0 +1,36 @@
+module sh.sysl.rheos
+
+struct Vec3 derives Eq
+    x: real
+    y: real
+    z: real
+
+    dot(self, b: Vec3) -> real = self.x * b.x + self.y * b.y + self.z * b.z
+    length(self) -> real = self.dot(self).sqrt()
+    array(self) -> [3]real = [self.x, self.y, self.z]
+    finite(self) -> bool = self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    cross(self, b: Vec3) -> Vec3 =
+        Vec3(self.y * b.z - self.z * b.y, self.z * b.x - self.x * b.z, self.x * b.y - self.y * b.x)
+    times(self, b: Vec3) -> Vec3 = Vec3(self.x * b.x, self.y * b.y, self.z * b.z)
+    unit(self) -> Vec3
+        val n = self.length()
+
+        if n > 1e-15 then self * (1.0 / n) else Vec3(1.0, 0.0, 0.0)
+end Vec3
+
+vec3(a: [3]real) -> Vec3 = Vec3(a[0], a[1], a[2])
+
+axis_vector(axis: int) -> Vec3
+    var a = [0.0, 0.0, 0.0]
+
+    a[axis] = 1.0
+    vec3(a)
+
+impl Add for Vec3
+    add(self, b: Vec3) -> Vec3 = Vec3(self.x + b.x, self.y + b.y, self.z + b.z)
+
+impl Sub for Vec3
+    sub(self, b: Vec3) -> Vec3 = Vec3(self.x - b.x, self.y - b.y, self.z - b.z)
+
+impl Mul[real] for Vec3
+    mul(self, s: real) -> Vec3 = Vec3(self.x * s, self.y * s, self.z * s)
