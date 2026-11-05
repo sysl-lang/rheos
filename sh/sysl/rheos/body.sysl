@@ -67,7 +67,7 @@ struct Body
             return self.mesh match
                 Some(mesh) -> mesh.inside_radius
                 None -> 0.0
-        if self.shape == Shape.Sphere then self.radius else min(self.half_size.x, min(self.half_size.y, self.half_size.z))
+        if self.shape == Shape.Sphere then self.radius else self.half_size.x.min(self.half_size.y.min(self.half_size.z))
 
     support(self, n: Vec3) -> Vec3
         if self.shape == Shape.Sphere then return self.position + n.unit() * self.radius
@@ -107,7 +107,7 @@ cuboid(position: Vec3, velocity: Vec3, half_size: Vec3, mass: real = 1.0,
 ellipsoid(position: Vec3, velocity: Vec3, semi_axes: Vec3, mass: real = 1.0,
           angular_velocity: Vec3 = Vec3(0.0, 0.0, 0.0), friction: real = 0.3,
           orientation: Quaternion[real] = Quaternion.identity()) -> Body =
-    Body(position, velocity, max(semi_axes.x, max(semi_axes.y, semi_axes.z)), mass, orientation,
+    Body(position, velocity, semi_axes.x.max(semi_axes.y.max(semi_axes.z)), mass, orientation,
          angular_velocity, Shape.Ellipsoid, semi_axes, friction, None)
 
 convex(position: Vec3, velocity: Vec3, hull: &Hull, mass: real = 1.0,

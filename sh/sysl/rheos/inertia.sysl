@@ -23,8 +23,8 @@ struct Inertia
         Inertia((self.y*self.z-self.yz*self.yz)/d, (self.x*self.z-self.xz*self.xz)/d,
                 (self.x*self.y-self.xy*self.xy)/d, (self.xz*self.yz-self.xy*self.z)/d,
                 (self.xy*self.yz-self.xz*self.y)/d, (self.xy*self.xz-self.x*self.yz)/d)
-    norm_bound(self) -> real = max(self.x.abs()+self.xy.abs()+self.xz.abs(),
-        max(self.y.abs()+self.xy.abs()+self.yz.abs(), self.z.abs()+self.xz.abs()+self.yz.abs()))
+    norm_bound(self) -> real = (self.x.abs()+self.xy.abs()+self.xz.abs()).max(
+        (self.y.abs()+self.xy.abs()+self.yz.abs()).max(self.z.abs()+self.xz.abs()+self.yz.abs()))
     smallest_bound(self) -> real = 1.0 / self.inverse().norm_bound()
     finite(self) -> bool = self.diagonal().finite() && self.xy.is_finite() && self.xz.is_finite() && self.yz.is_finite()
     positive(self) -> bool = self.x > 0 && self.x*self.y-self.xy*self.xy > 0 && self.determinant() > 0

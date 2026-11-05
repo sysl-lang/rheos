@@ -154,7 +154,7 @@ private face(vertices: []Support, i: int, j: int, k: int, inside: Vec3) -> Face
         n = n * -1.0
         second = k
         third = j
-    Face(i, second, third, n, max(0.0, n.dot(p)))
+    Face(i, second, third, n, 0.0.max(n.dot(p)))
 end face
 
 private witness(vertices: []Support, f: Face) -> Manifold
@@ -172,9 +172,9 @@ private witness(vertices: []Support, f: Face) -> Manifold
     var wc = 0.0
 
     if denominator > 1e-24
-        wb = max(0.0, min(1.0, (vv*w.dot(u)-uv*w.dot(v))/denominator))
-        wc = max(0.0, min(1.0, (uu*w.dot(v)-uv*w.dot(u))/denominator))
-    val wa = max(0.0, 1.0-wb-wc)
+        wb = ((vv*w.dot(u)-uv*w.dot(v))/denominator).clamp(0.0, 1.0)
+        wc = ((uu*w.dot(v)-uv*w.dot(u))/denominator).clamp(0.0, 1.0)
+    val wa = (1.0-wb-wc).max(0.0)
     val total = wa+wb+wc
     val pa = (a.a*wa+b.a*wb+c.a*wc) * (1.0/total)
     val pb = (a.b*wa+b.b*wb+c.b*wc) * (1.0/total)

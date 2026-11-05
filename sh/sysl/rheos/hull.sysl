@@ -33,7 +33,7 @@ hull(vertices: []const Vec3, faces: []const [3]int) -> Result[&Hull, string]
 
     for p in vertices
         if !p.finite() then return Err("hull vertices must be finite")
-        scale = max(scale, (p - reference).length())
+        scale = scale.max((p - reference).length())
     if !scale.is_finite() || scale == 0 then return Err("hull has no extent")
 
     for f in faces
@@ -102,8 +102,8 @@ hull(vertices: []const Vec3, faces: []const [3]int) -> Result[&Hull, string]
         val xyz = local.array()
 
         points.push(local)
-        radius = max(radius, local.length())
-        for k in 0..<3 do size[k] = max(size[k], xyz[k].abs())
+        radius = radius.max(local.length())
+        for k in 0..<3 do size[k] = size[k].max(xyz[k].abs())
     end for
 
     for f in faces
@@ -111,7 +111,7 @@ hull(vertices: []const Vec3, faces: []const [3]int) -> Result[&Hull, string]
         val a = points[f[0]]
         val normal = (points[f[1]]-a).cross(points[f[2]]-a).unit()
 
-        inside = min(inside, a.dot(normal))
+        inside = inside.min(a.dot(normal))
     end for
 
     if inside <= scale*1e-10 then return Err("hull has no interior around its centre of mass")

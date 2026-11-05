@@ -14,7 +14,7 @@ struct StepStats
 // Allocation-free, with input validation before mutation. Discrete, adaptive collision steps.
 step(bodies: []Body, box: Enclosure, dt: real) -> Result[StepStats, string]
     val h = box.half_size
-    val room_radius = min(h.x, min(h.y, h.z))
+    val room_radius = h.x.min(h.y.min(h.z))
 
     if !h.finite() || room_radius <= 0
         return Err("box half sizes must be finite and positive")
@@ -46,11 +46,11 @@ step(bodies: []Body, box: Enclosure, dt: real) -> Result[StepStats, string]
            !q.norm_squared().is_finite() || (q.norm_squared() - 1.0).abs() > 1e-6
             return Err("bodies need finite state, positive dimensions and mass, fitting bounds, unit orientation and friction in [0,1]")
 
-        smallest = min(smallest, b.smallest_extent())
-        least_mass = min(least_mass, b.mass)
-        least_inertia = min(least_inertia, minimum_inertia)
-        largest_radius = max(largest_radius, b.radius)
-        anisotropy = max(anisotropy, maximum_inertia / minimum_inertia)
+        smallest = smallest.min(b.smallest_extent())
+        least_mass = least_mass.min(b.mass)
+        least_inertia = least_inertia.min(minimum_inertia)
+        largest_radius = largest_radius.max(b.radius)
+        anisotropy = anisotropy.max(maximum_inertia / minimum_inertia)
         total_energy += b.kinetic_energy()
     end for
 
@@ -58,7 +58,7 @@ step(bodies: []Body, box: Enclosure, dt: real) -> Result[StepStats, string]
     val spin_bound = (2.0 * total_energy / least_inertia).sqrt()
     val travel = (speed_bound + spin_bound * largest_radius) * dt / (smallest * 0.2)
     val rotation = spin_bound * dt * anisotropy / 0.05
-    val divisions = max(travel, rotation)
+    val divisions = travel.max(rotation)
 
     if !divisions.is_finite() || divisions > 4095
         return Err("step needs too many substeps; reduce the time step or speed")
